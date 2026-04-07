@@ -4,14 +4,27 @@ import static ps.reso.instaeclipse.mods.ghost.ui.GhostEmojiManager.addGhostEmoji
 
 import android.annotation.SuppressLint;
 import android.app.Activity;
+import android.content.ContentValues;
+import android.content.Context;
+import android.graphics.Bitmap;
+import android.graphics.Canvas;
+import android.graphics.drawable.BitmapDrawable;
+import android.graphics.drawable.Drawable;
+import android.net.Uri;
+import android.os.Build;
 import android.os.Handler;
 import android.os.Looper;
+import android.provider.MediaStore;
 import android.util.Log;
 import android.view.View;
 import android.view.ViewGroup;
+import android.widget.ImageView;
 import android.widget.Toast;
 
+import java.io.OutputStream;
+import java.util.ArrayDeque;
 import java.util.Map;
+import java.util.Queue;
 
 import de.robv.android.xposed.XC_MethodHook;
 import de.robv.android.xposed.XposedBridge;
@@ -27,6 +40,8 @@ import ps.reso.instaeclipse.utils.ghost.GhostModeUtils;
 import ps.reso.instaeclipse.utils.toast.CustomToast;
 
 public class UIHookManager {
+    private static final int MIN_FEED_IMAGE_AREA_PX = 40000;
+    private static final String FEED_DOWNLOAD_TAG = "instaeclipse_feed_download_button";
 
     @SuppressLint("StaticFieldLeak")
     private static Activity currentActivity;
@@ -128,6 +143,157 @@ public class UIHookManager {
             return true;
         });
 
+        injectFeedDownloadButtons(activity);
+
+    }
+
+    private static void injectFeedDownloadButtons(Activity activity) {
+        final String[] possibleActionButtons = {
+                "row_feed_button_comment",
+                "feed_comment_button",
+                "row_feed_button_like",
+                "feed_like_button"
+        };
+
+        for (String actionId : possibleActionButtons) {
+            @SuppressLint("DiscouragedApi")
+            int viewId = activity.getResources().getIdentifier(actionId, "id", activity.getPackageName());
+            if (viewId == 0) {
+                continue;
+            }
+
+            View actionView = activity.findViewById(viewId);
+            if (actionView == null) {
+                continue;
+            }
+
+            if (!(actionView.getParent() instanceof ViewGroup actionBar)) {
+                continue;
+            }
+
+            if (actionBar.findViewWithTag(FEED_DOWNLOAD_TAG) != null) {
+                continue;
+            }
+
+            ImageView downloadButton = new ImageView(activity);
+            downloadButton.setTag(FEED_DOWNLOAD_TAG);
+            downloadButton.setImageResource(android.R.drawable.stat_sys_download_done);
+            downloadButton.setContentDescription("Download image");
+            int size = dpToPx(activity, 24);
+            int padding = dpToPx(activity, 8);
+            ViewGroup.MarginLayoutParams params = new ViewGroup.MarginLayoutParams(size, size);
+            params.leftMargin = dpToPx(activity, 8);
+            downloadButton.setLayoutParams(params);
+            downloadButton.setPadding(padding / 2, padding / 2, padding / 2, padding / 2);
+            downloadButton.setClickable(true);
+            downloadButton.setFocusable(true);
+
+            downloadButton.setOnClickListener(v -> {
+                Drawable drawable = findFeedImageDrawableFromAnchor(actionBar);
+                if (drawable == null) {
+                    Toast.makeText(activity, "Unable to find feed image", Toast.LENGTH_SHORT).show();
+                    return;
+                }
+
+                Bitmap bitmap = drawableToBitmap(drawable);
+                if (bitmap == null) {
+                    Toast.makeText(activity, "Unable to capture image", Toast.LENGTH_SHORT).show();
+                    return;
+                }
+
+                boolean saved = saveBitmapToGallery(activity, bitmap);
+                Toast.makeText(activity, saved ? "Image downloaded" : "Download failed", Toast.LENGTH_SHORT).show();
+                if (saved) {
+                    VibrationUtil.vibrate(activity);
+                }
+            });
+
+            actionBar.addView(downloadButton);
+        }
+    }
+
+    private static int dpToPx(Context context, int dp) {
+        float density = context.getResources().getDisplayMetrics().density;
+        return (int) (dp * density);
+    }
+
+    private static Drawable findFeedImageDrawableFromAnchor(View anchorView) {
+        View root = anchorView.getRootView();
+        if (!(root instanceof ViewGroup rootGroup)) {
+            return null;
+        }
+
+        Queue<View> queue = new ArrayDeque<>();
+        queue.add(rootGroup);
+        Drawable bestDrawable = null;
+        int bestArea = 0;
+
+        while (!queue.isEmpty()) {
+            View current = queue.poll();
+            if (current instanceof ImageView imageView) {
+                Drawable drawable = imageView.getDrawable();
+                int area = imageView.getWidth() * imageView.getHeight();
+                if (drawable != null && area > MIN_FEED_IMAGE_AREA_PX && area > bestArea) {
+                    bestDrawable = drawable;
+                    bestArea = area;
+                }
+            }
+
+            if (current instanceof ViewGroup group) {
+                for (int i = 0; i < group.getChildCount(); i++) {
+                    queue.add(group.getChildAt(i));
+                }
+            }
+        }
+
+        return bestDrawable;
+    }
+
+    private static Bitmap drawableToBitmap(Drawable drawable) {
+        if (drawable instanceof BitmapDrawable bitmapDrawable && bitmapDrawable.getBitmap() != null) {
+            return bitmapDrawable.getBitmap();
+        }
+
+        int width = Math.max(drawable.getIntrinsicWidth(), 1);
+        int height = Math.max(drawable.getIntrinsicHeight(), 1);
+        Bitmap bitmap = Bitmap.createBitmap(width, height, Bitmap.Config.ARGB_8888);
+        Canvas canvas = new Canvas(bitmap);
+        drawable.setBounds(0, 0, canvas.getWidth(), canvas.getHeight());
+        drawable.draw(canvas);
+        return bitmap;
+    }
+
+    private static boolean saveBitmapToGallery(Context context, Bitmap bitmap) {
+        String fileName = "instaeclipse_" + System.currentTimeMillis() + ".jpg";
+        ContentValues values = new ContentValues();
+        values.put(MediaStore.Images.Media.DISPLAY_NAME, fileName);
+        values.put(MediaStore.Images.Media.MIME_TYPE, "image/jpeg");
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            values.put(MediaStore.Images.Media.RELATIVE_PATH, "Pictures/InstaEclipse");
+            values.put(MediaStore.Images.Media.IS_PENDING, 1);
+        }
+
+        Uri uri = context.getContentResolver().insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values);
+        if (uri == null) {
+            return false;
+        }
+
+        try (OutputStream stream = context.getContentResolver().openOutputStream(uri)) {
+            if (stream == null) {
+                return false;
+            }
+
+            boolean compressed = bitmap.compress(Bitmap.CompressFormat.JPEG, 95, stream);
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                ContentValues pendingValues = new ContentValues();
+                pendingValues.put(MediaStore.Images.Media.IS_PENDING, 0);
+                context.getContentResolver().update(uri, pendingValues, null, null);
+            }
+            return compressed;
+        } catch (Exception e) {
+            XposedBridge.log("(InstaEclipse | FeedDownload): Failed to save image: " + e.getMessage());
+            return false;
+        }
     }
 
     // Hook long press method
