@@ -1,57 +1,60 @@
-name: Build Debug APK
+name: Android CI
 
 on:
-  push:
-    branches:
-      - main  # Trigger workflow on pushes to the main branch
-      - 0.4
-  pull_request:
-    branches:
-      - main  # Trigger workflow on pull requests to the main branch
-  workflow_dispatch:  # Allow manual triggering via the GitHub Actions UI
+  workflow_dispatch:
 
 jobs:
-  build_debug_apk:
+  build:
+    permissions: write-all
     runs-on: ubuntu-latest
 
     steps:
-      # Step 1: Check out the repository
-      - name: Checkout repository
-        uses: actions/checkout@v4
+      - uses: actions/checkout@v4
 
-      # Step 2: Set up JDK 17
-      - name: Set up JDK 17
-        uses: actions/setup-java@v4
+      - name: Set up Java 17
+        uses: actions/setup-java@v3
         with:
-          distribution: 'zulu'
-          java-version: '17'
+          distribution: "temurin"
+          java-version: "17"
 
-      # Step 3: Cache Gradle dependencies
-      - name: Cache Gradle dependencies
-        uses: actions/cache@v4
-        with:
-          path: |
-            ~/.gradle/caches
-            ~/.gradle/wrapper
-          key: ${{ runner.os }}-gradle-${{ hashFiles('**/*.gradle*', '**/gradle-wrapper.properties') }}
-          restore-keys: |
-            ${{ runner.os }}-gradle
-
-      # Step 4: Set up Android SDK
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v2
-
-      # Step 5: Grant execution permissions to gradlew
       - name: Grant execute permission to gradlew
         run: chmod +x ./gradlew
 
-      # Step 6: Build the debug APK
       - name: Build Debug APK
         run: ./gradlew assembleDebug
 
-      # Step 7: Upload the debug APK as an artifact
-      - name: Upload APK
+      - name: Upload debug APK artifact
         uses: actions/upload-artifact@v4
         with:
           name: debug-apk
           path: app/build/outputs/apk/debug/app-debug.apk
+
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
+
+      - name: Upload APK to GoFile
+        id: upload_gofile
+        run: |
+          APK_PATH="app/build/outputs/apk/debug/app-debug.apk"
+          if [ ! -f "${APK_PATH}" ]; then
+            echo "APK not found at ${APK_PATH}"
+            exit 1
+          fi
+
+          SERVER=$(curl -s https://api.gofile.io/servers | jq -r '.data.servers[0].name')
+          FILE_URL=$(curl -s -F "file=@${APK_PATH}" "https://${SERVER}.gofile.io/uploadFile" | jq -r '.data.downloadPage')
+
+          if [ -z "${FILE_URL}" ] || [ "${FILE_URL}" = "null" ]; then
+            echo "Failed to upload APK to GoFile"
+            exit 1
+          fi
+
+          echo "FILE_URL=${FILE_URL}" >> "$GITHUB_ENV"
+          echo "file_url=${FILE_URL}" >> "$GITHUB_OUTPUT"
+
+      - name: Print GoFile URL in Actions
+        run: |
+          echo "GoFile download URL: ${{ steps.upload_gofile.outputs.file_url }}"
+          echo "### APK uploaded to GoFile" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          echo "- Download URL: ${{ steps.upload_gofile.outputs.file_url }}" >> "$GITHUB_STEP_SUMMARY"

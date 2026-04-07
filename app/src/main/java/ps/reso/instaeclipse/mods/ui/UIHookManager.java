@@ -4,6 +4,8 @@ import static ps.reso.instaeclipse.mods.ghost.ui.GhostEmojiManager.addGhostEmoji
 
 import android.annotation.SuppressLint;
 import android.app.Activity;
+import android.Manifest;
+import android.content.pm.PackageManager;
 import android.content.ContentValues;
 import android.content.Context;
 import android.graphics.Bitmap;
@@ -18,6 +20,7 @@ import android.provider.MediaStore;
 import android.util.Log;
 import android.view.View;
 import android.view.ViewGroup;
+import android.view.ViewTreeObserver;
 import android.widget.ImageView;
 import android.widget.Toast;
 
@@ -41,7 +44,10 @@ import ps.reso.instaeclipse.utils.toast.CustomToast;
 
 public class UIHookManager {
     private static final int MIN_FEED_IMAGE_AREA_PX = 40000;
+    private static final int MIN_POST_CONTAINER_IMAGE_AREA_PX = 160000;
+    private static final int STORAGE_PERMISSION_REQUEST_CODE = 4019;
     private static final String FEED_DOWNLOAD_TAG = "instaeclipse_feed_download_button";
+    private static final String FEED_DOWNLOAD_SCAN_TAG = "instaeclipse_feed_download_scan_listener";
 
     @SuppressLint("StaticFieldLeak")
     private static Activity currentActivity;
@@ -144,6 +150,7 @@ public class UIHookManager {
         });
 
         injectFeedDownloadButtons(activity);
+        ensureFeedDownloadInjectionOnLayout(activity);
 
     }
 
@@ -189,7 +196,13 @@ public class UIHookManager {
             downloadButton.setFocusable(true);
 
             downloadButton.setOnClickListener(v -> {
-                Drawable drawable = findFeedImageDrawableFromAnchor(actionBar);
+                if (!hasStorageAccess(activity)) {
+                    requestLegacyStoragePermission(activity);
+                    Toast.makeText(activity, "Grant storage permission, then tap download again", Toast.LENGTH_SHORT).show();
+                    return;
+                }
+
+                Drawable drawable = findFeedImageDrawableFromActionBar(actionBar);
                 if (drawable == null) {
                     Toast.makeText(activity, "Unable to find feed image", Toast.LENGTH_SHORT).show();
                     return;
@@ -210,6 +223,114 @@ public class UIHookManager {
 
             actionBar.addView(downloadButton);
         }
+
+        injectButtonsByHeuristicScan(activity);
+    }
+
+    private static void ensureFeedDownloadInjectionOnLayout(Activity activity) {
+        final View root = activity.getWindow().getDecorView();
+        if (root.getTag() != null && FEED_DOWNLOAD_SCAN_TAG.equals(root.getTag().toString())) {
+            return;
+        }
+
+        root.setTag(FEED_DOWNLOAD_SCAN_TAG);
+        root.getViewTreeObserver().addOnGlobalLayoutListener(new ViewTreeObserver.OnGlobalLayoutListener() {
+            @Override
+            public void onGlobalLayout() {
+                try {
+                    injectButtonsByHeuristicScan(activity);
+                } catch (Exception ignored) {
+                }
+            }
+        });
+    }
+
+    private static void injectButtonsByHeuristicScan(Activity activity) {
+        View root = activity.getWindow().getDecorView();
+        if (!(root instanceof ViewGroup rootGroup)) {
+            return;
+        }
+
+        Queue<View> queue = new ArrayDeque<>();
+        queue.add(rootGroup);
+
+        while (!queue.isEmpty()) {
+            View current = queue.poll();
+            if (current instanceof ViewGroup group) {
+                if (looksLikeFeedActionBar(group) && group.findViewWithTag(FEED_DOWNLOAD_TAG) == null) {
+                    addDownloadButtonToActionBar(activity, group);
+                }
+                for (int i = 0; i < group.getChildCount(); i++) {
+                    queue.add(group.getChildAt(i));
+                }
+            }
+        }
+    }
+
+    private static boolean looksLikeFeedActionBar(ViewGroup group) {
+        boolean hasLike = false;
+        boolean hasComment = false;
+
+        for (int i = 0; i < group.getChildCount(); i++) {
+            View child = group.getChildAt(i);
+            CharSequence desc = child.getContentDescription();
+            if (desc == null) {
+                continue;
+            }
+            String text = desc.toString().toLowerCase();
+            if (text.contains("like")) {
+                hasLike = true;
+            }
+            if (text.contains("comment")) {
+                hasComment = true;
+            }
+        }
+
+        return hasLike && hasComment;
+    }
+
+    private static void addDownloadButtonToActionBar(Activity activity, ViewGroup actionBar) {
+        ImageView downloadButton = new ImageView(activity);
+        downloadButton.setTag(FEED_DOWNLOAD_TAG);
+        downloadButton.setImageResource(android.R.drawable.stat_sys_download_done);
+        downloadButton.setContentDescription("Download image");
+        int size = dpToPx(activity, 24);
+        int padding = dpToPx(activity, 8);
+        ViewGroup.MarginLayoutParams params = new ViewGroup.MarginLayoutParams(size, size);
+        params.leftMargin = dpToPx(activity, 8);
+        downloadButton.setLayoutParams(params);
+        downloadButton.setPadding(padding / 2, padding / 2, padding / 2, padding / 2);
+        downloadButton.setClickable(true);
+        downloadButton.setFocusable(true);
+        downloadButton.setAlpha(0.95f);
+
+        downloadButton.setOnClickListener(v -> {
+            if (!hasStorageAccess(activity)) {
+                requestLegacyStoragePermission(activity);
+                Toast.makeText(activity, "Grant storage permission, then tap download again", Toast.LENGTH_SHORT).show();
+                return;
+            }
+
+            Drawable drawable = findFeedImageDrawableFromActionBar(actionBar);
+            if (drawable == null) {
+                Toast.makeText(activity, "Unable to find feed image", Toast.LENGTH_SHORT).show();
+                return;
+            }
+
+            Bitmap bitmap = drawableToBitmap(drawable);
+            if (bitmap == null) {
+                Toast.makeText(activity, "Unable to capture image", Toast.LENGTH_SHORT).show();
+                return;
+            }
+
+            boolean saved = saveBitmapToGallery(activity, bitmap);
+            Toast.makeText(activity, saved ? "Image downloaded" : "Download failed", Toast.LENGTH_SHORT).show();
+            if (saved) {
+                VibrationUtil.vibrate(activity);
+            }
+        });
+
+        actionBar.addView(downloadButton);
     }
 
     private static int dpToPx(Context context, int dp) {
@@ -217,9 +338,49 @@ public class UIHookManager {
         return (int) (dp * density);
     }
 
-    private static Drawable findFeedImageDrawableFromAnchor(View anchorView) {
-        View root = anchorView.getRootView();
-        if (!(root instanceof ViewGroup rootGroup)) {
+    private static boolean hasStorageAccess(Activity activity) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            return true;
+        }
+        return activity.checkSelfPermission(Manifest.permission.WRITE_EXTERNAL_STORAGE) == PackageManager.PERMISSION_GRANTED;
+    }
+
+    private static void requestLegacyStoragePermission(Activity activity) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            return;
+        }
+        activity.requestPermissions(new String[]{Manifest.permission.WRITE_EXTERNAL_STORAGE}, STORAGE_PERMISSION_REQUEST_CODE);
+    }
+
+    private static Drawable findFeedImageDrawableFromActionBar(View actionBar) {
+        ViewGroup postContainer = findLikelyPostContainer(actionBar);
+        if (postContainer == null) {
+            return null;
+        }
+
+        return findLargestImageDrawable(postContainer, MIN_FEED_IMAGE_AREA_PX);
+    }
+
+    private static ViewGroup findLikelyPostContainer(View startView) {
+        View current = startView;
+        int maxDepth = 12;
+        while (current != null && maxDepth-- > 0) {
+            if (current instanceof ViewGroup candidate) {
+                Drawable preview = findLargestImageDrawable(candidate, MIN_POST_CONTAINER_IMAGE_AREA_PX);
+                if (preview != null) {
+                    return candidate;
+                }
+            }
+            if (!(current.getParent() instanceof View)) {
+                break;
+            }
+            current = (View) current.getParent();
+        }
+        return null;
+    }
+
+    private static Drawable findLargestImageDrawable(ViewGroup rootGroup, int minAreaPx) {
+        if (rootGroup == null) {
             return null;
         }
 
@@ -233,7 +394,7 @@ public class UIHookManager {
             if (current instanceof ImageView imageView) {
                 Drawable drawable = imageView.getDrawable();
                 int area = imageView.getWidth() * imageView.getHeight();
-                if (drawable != null && area > MIN_FEED_IMAGE_AREA_PX && area > bestArea) {
+                if (drawable != null && area > minAreaPx && area > bestArea) {
                     bestDrawable = drawable;
                     bestArea = area;
                 }
@@ -280,17 +441,24 @@ public class UIHookManager {
 
         try (OutputStream stream = context.getContentResolver().openOutputStream(uri)) {
             if (stream == null) {
+                context.getContentResolver().delete(uri, null, null);
                 return false;
             }
 
             boolean compressed = bitmap.compress(Bitmap.CompressFormat.JPEG, 95, stream);
+            if (!compressed) {
+                context.getContentResolver().delete(uri, null, null);
+                return false;
+            }
+
             if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
                 ContentValues pendingValues = new ContentValues();
                 pendingValues.put(MediaStore.Images.Media.IS_PENDING, 0);
                 context.getContentResolver().update(uri, pendingValues, null, null);
             }
-            return compressed;
+            return true;
         } catch (Exception e) {
+            context.getContentResolver().delete(uri, null, null);
             XposedBridge.log("(InstaEclipse | FeedDownload): Failed to save image: " + e.getMessage());
             return false;
         }
